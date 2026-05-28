@@ -8,9 +8,11 @@ import {
   submitWork,
   enforceDeadline,
 } from "@/lib/contract";
+import CancelJobConfirmModal from "@/components/CancelJobConfirmModal";
 import EmptyState from "@/components/EmptyState";
 import ErrorBanner from "@/components/ErrorBanner";
 import SectionCard from "@/components/SectionCard";
+import { useToast } from "@/components/ToastProvider";
 import { toXlm } from "@/lib/format";
 import { useWallet } from "@/lib/wallet-context";
 import type { Job, JobStatus } from "@/lib/types";
@@ -49,11 +51,13 @@ function formatDeadline(deadline: string) {
 
 export default function DashboardPage() {
   const { wallet, connectWallet } = useWallet();
+  const { showSuccess, showError } = useToast();
   const [allJobs, setAllJobs] = useState<Array<{ id: number; job: Job }>>([]);
   const [statusFilter, setStatusFilter] = useState<JobStatus | "All">("All");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<number | null>(null);
+  const [pendingCancelJobId, setPendingCancelJobId] = useState<number | null>(null);
   const filterOptions: Array<JobStatus | "All"> = ["All", ...STATUS_OPTIONS];
   const filterButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
@@ -88,16 +92,36 @@ export default function DashboardPage() {
     }
   }, [wallet, fetchJobs]);
 
-  const handleAction = async (fn: () => Promise<unknown>, jobId: number) => {
+  const handleAction = async (
+    fn: () => Promise<unknown>,
+    jobId: number,
+    successMessage = "Action completed successfully.",
+  ) => {
     setActionLoading(jobId);
     try {
       await fn();
       await fetchJobs();
+      showSuccess(successMessage);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Action failed.");
+      const message = e instanceof Error ? e.message : "Action failed.";
+      setError(message);
+      showError(message);
     } finally {
       setActionLoading(null);
     }
+  };
+
+  const handleConfirmCancel = async () => {
+    if (!wallet || pendingCancelJobId === null) {
+      return;
+    }
+    const jobId = pendingCancelJobId;
+    await handleAction(
+      () => cancelJob(wallet, String(jobId)),
+      jobId,
+      "Job cancelled and funds refunded.",
+    );
+    setPendingCancelJobId(null);
   };
 
   const postedJobs = allJobs.filter((j) => j.job.client === wallet);
@@ -187,6 +211,7 @@ export default function DashboardPage() {
             role="client"
             actionLoading={actionLoading}
             onAction={handleAction}
+            onRequestCancel={setPendingCancelJobId}
           />
           <JobSection
             title="Accepted Jobs"
@@ -196,8 +221,20 @@ export default function DashboardPage() {
             role="freelancer"
             actionLoading={actionLoading}
             onAction={handleAction}
+            onRequestCancel={setPendingCancelJobId}
           />
         </>
+      )}
+
+      {pendingCancelJobId !== null && (
+        <CancelJobConfirmModal
+          jobId={String(pendingCancelJobId)}
+          loading={actionLoading === pendingCancelJobId}
+          onClose={() => setPendingCancelJobId(null)}
+          onConfirm={() => {
+            void handleConfirmCancel();
+          }}
+        />
       )}
     </section>
   );
@@ -211,6 +248,7 @@ function JobSection({
   role,
   actionLoading,
   onAction,
+  onRequestCancel,
 }: {
   title: string;
   subtitle: string;
@@ -219,6 +257,7 @@ function JobSection({
   role: "client" | "freelancer";
   actionLoading: number | null;
   onAction: (fn: () => Promise<unknown>, jobId: number) => Promise<void>;
+  onRequestCancel: (jobId: number) => void;
 }) {
   return (
     <div>
@@ -240,6 +279,7 @@ function JobSection({
                 role={role}
                 isLoading={actionLoading === id}
                 onAction={onAction}
+                onRequestCancel={onRequestCancel}
               />
             </li>
           ))}
@@ -256,6 +296,7 @@ function JobCard({
   role,
   isLoading,
   onAction,
+  onRequestCancel,
 }: {
   id: number;
   job: Job;
@@ -263,6 +304,7 @@ function JobCard({
   role: "client" | "freelancer";
   isLoading: boolean;
   onAction: (fn: () => Promise<unknown>, jobId: number) => Promise<void>;
+  onRequestCancel: (jobId: number) => void;
 }) {
   const actions = getActions(id, job, wallet, role);
 
@@ -298,8 +340,15 @@ function JobCard({
               key={action.label}
               disabled={isLoading}
               className="min-w-0 flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 sm:flex-none sm:max-w-44"
-              onClick={() => onAction(() => action.fn(), id)}
+              onClick={() => {
+                if (action.label === "Cancel Job") {
+                  onRequestCancel(id);
+                  return;
+                }
+                void onAction(() => action.fn(), id);
+              }}
               title={action.label}
+              aria-haspopup={action.label === "Cancel Job" ? "dialog" : undefined}
             >
               <span className="block truncate">{isLoading ? "..." : action.label}</span>
             </button>

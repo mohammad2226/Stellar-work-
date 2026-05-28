@@ -7,8 +7,8 @@ use soroban_sdk::{
 
 const DEFAULT_FEE_BPS: i128 = 250;
 const MAX_FEE_BPS: i128 = 1_000;
+const MAX_FEE_BPS_CONFIG: i128 = 10_000;
 const BPS_DENOMINATOR: i128 = 10_000;
-const MAX_FEE_BPS: i128 = 10_000;
 const MAX_REVISIONS: u32 = 3;
 const CONTRACT_VERSION: u32 = 1;
 
@@ -68,6 +68,7 @@ pub enum DataKey {
     AllowedToken(Address),
     TokenFees(Address),
     FeeBps,
+    MaxActiveJobsPerClient,
 }
 
 #[contracterror]
@@ -83,12 +84,13 @@ pub enum Error {
     DeadlineNotExpired = 7,
     TokenNotAllowed = 8,
     FeeTooHigh = 9,
-    RevisionLimitReached = 9,
+    RevisionLimitReached = 16,
     AlreadyInitialized = 10,
     InvalidAmount = 11,
     InvalidDescriptionHash = 12,
     UnauthorizedAdmin = 13,
     InvalidDeadline = 14,
+    ActiveJobLimitExceeded = 15,
 }
 
 #[contract]
@@ -144,6 +146,7 @@ impl EscrowContract {
         {
             panic_with_error!(&e, Error::TokenNotAllowed);
         }
+        enforce_client_active_job_limit(&e, &client);
 
         let token_client = token::Client::new(&e, &token);
         token_client.transfer(&client, &e.current_contract_address(), &amount);
@@ -470,7 +473,7 @@ impl EscrowContract {
     }
 
     pub fn update_fee(e: Env, new_fee_bps: i128) {
-        let admin = get_admin(&e);
+        let admin = load_admin(&e);
         admin.require_auth();
         if new_fee_bps > MAX_FEE_BPS {
             panic_with_error!(&e, Error::FeeTooHigh);
@@ -592,13 +595,6 @@ impl EscrowContract {
         CONTRACT_VERSION
     }
 
-    pub fn get_fee_bps(e: Env) -> i128 {
-        e.storage()
-            .instance()
-            .get::<DataKey, i128>(&DataKey::FeeBps)
-            .unwrap_or(DEFAULT_FEE_BPS)
-    }
-
     pub fn update_fee_bps(e: Env, caller: Address, new_fee_bps: i128) {
         caller.require_auth();
         let admin = load_admin(&e);
@@ -606,7 +602,7 @@ impl EscrowContract {
             panic_with_error!(&e, Error::Unauthorized);
         }
 
-        if new_fee_bps <= 0 || new_fee_bps > MAX_FEE_BPS {
+        if new_fee_bps <= 0 || new_fee_bps > MAX_FEE_BPS_CONFIG {
             panic_with_error!(&e, Error::InvalidAmount);
         }
 
@@ -673,6 +669,77 @@ impl EscrowContract {
         e.storage()
             .persistent()
             .has(&DataKey::AllowedToken(token))
+    }
+
+    pub fn set_max_active_jobs_per_client(e: Env, caller: Address, limit: u32) {
+        caller.require_auth();
+        let admin = load_admin(&e);
+        if caller != admin {
+            panic_with_error!(&e, Error::Unauthorized);
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::MaxActiveJobsPerClient, &limit);
+        bump_instance_ttl(&e);
+        e.events().publish(
+            (Symbol::new(&e, "max_active_jobs_updated"),),
+            (caller, limit),
+        );
+    }
+
+    pub fn get_max_active_jobs_per_client(e: Env) -> u32 {
+        e.storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::MaxActiveJobsPerClient)
+            .unwrap_or(0)
+    }
+
+    pub fn get_client_active_jobs_count(e: Env, client: Address) -> u32 {
+        count_client_active_jobs(&e, &client)
+    }
+}
+
+fn is_active_job_status(status: &JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Open
+            | JobStatus::InProgress
+            | JobStatus::SubmittedForReview
+            | JobStatus::Disputed
+    )
+}
+
+fn count_client_active_jobs(e: &Env, client: &Address) -> u32 {
+    let total = get_jobs_count(e);
+    let mut count: u32 = 0;
+    let mut i: u64 = 1;
+    while i <= total {
+        if let Some(job) = e
+            .storage()
+            .persistent()
+            .get::<DataKey, Job>(&DataKey::Job(i))
+        {
+            if &job.client == client && is_active_job_status(&job.status) {
+                count = count.saturating_add(1);
+            }
+        }
+        i = i.saturating_add(1);
+    }
+    count
+}
+
+fn enforce_client_active_job_limit(e: &Env, client: &Address) {
+    let limit = e
+        .storage()
+        .instance()
+        .get::<DataKey, u32>(&DataKey::MaxActiveJobsPerClient)
+        .unwrap_or(0);
+    if limit == 0 {
+        return;
+    }
+    let active = count_client_active_jobs(e, client);
+    if active >= limit {
+        panic_with_error!(e, Error::ActiveJobLimitExceeded);
     }
 }
 
@@ -884,7 +951,7 @@ mod test {
 
     #[test]
     fn accept_and_approve_happy_path() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -926,7 +993,7 @@ mod test {
 
     #[test]
     fn reject_work_happy_path_and_resubmit() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -945,7 +1012,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Contract, #2)")]
     fn reject_work_wrong_caller_fails() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -956,16 +1023,16 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Contract, #3)")]
     fn reject_work_wrong_status_fails() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.reject_work(&user, &job_id);
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #9)")]
+    #[should_panic(expected = "Error(Contract, #16)")]
     fn reject_work_revision_limit_fails() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
 
@@ -980,7 +1047,7 @@ mod test {
 
     #[test]
     fn ttl_bumped_on_state_transitions() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -998,7 +1065,7 @@ mod test {
 
     #[test]
     fn extend_job_ttl_by_freelancer() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.extend_job_ttl(&freelancer, &job_id);
@@ -1017,7 +1084,7 @@ mod test {
     #[test]
     #[should_panic]
     fn submit_work_past_deadline() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let deadline = 1_710_000_000 + 3600;
         let job_id =
             client.post_job(&user, &1_000_000i128, &hash(&env), &deadline, &native_token);
@@ -1032,7 +1099,7 @@ mod test {
 
     #[test]
     fn submit_work_no_deadline_always_allowed() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
 
@@ -1050,7 +1117,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Contract, #2)")]
     fn client_cannot_submit_work() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
 
@@ -1060,7 +1127,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Contract, #2)")]
     fn random_address_cannot_submit_work() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
 
@@ -1079,7 +1146,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Contract, #3)")]
     fn submit_work_on_completed_job_panics() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -1090,7 +1157,7 @@ mod test {
 
     #[test]
     fn enforce_deadline_reclaims_funds() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let deadline = 1_710_000_000 + 3600;
         let token_client = token::Client::new(&env, &native_token);
         let pre_balance = token_client.balance(&user);
@@ -1113,7 +1180,7 @@ mod test {
     #[test]
     #[should_panic]
     fn enforce_deadline_before_expiry_fails() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let deadline = 1_710_000_000 + 3600;
         let job_id =
             client.post_job(&user, &1_000_000i128, &hash(&env), &deadline, &native_token);
@@ -1124,7 +1191,7 @@ mod test {
     #[test]
     #[should_panic]
     fn enforce_deadline_no_deadline_fails() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
 
@@ -1161,7 +1228,7 @@ mod test {
 
     #[test]
     fn events_emitted_on_full_lifecycle() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -1303,7 +1370,7 @@ mod test {
 
     #[test]
     fn raise_and_resolve_dispute_client_wins() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let token_client = token::Client::new(&env, &native_token);
         let pre_balance = token_client.balance(&user);
 
@@ -1313,7 +1380,7 @@ mod test {
         assert_eq!(client.get_job(&job_id).status, JobStatus::Disputed);
 
         // client_bps = 10_000 → full refund to client
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 });
+        client.resolve_dispute(&admin, &job_id, &DisputeResolution { client_bps: 10_000 });
         let post_balance = token_client.balance(&user);
         assert_eq!(post_balance, pre_balance);
         assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
@@ -1321,7 +1388,7 @@ mod test {
 
     #[test]
     fn raise_and_resolve_dispute_freelancer_wins() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -1331,7 +1398,7 @@ mod test {
         let pre_balance = token_client.balance(&freelancer);
 
         // client_bps = 0 → full payout to freelancer minus fee
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 });
+        client.resolve_dispute(&admin, &job_id, &DisputeResolution { client_bps: 0 });
 
         let post_balance = token_client.balance(&freelancer);
         assert_eq!(post_balance - pre_balance, 975_000);
@@ -1341,7 +1408,7 @@ mod test {
 
     #[test]
     fn client_can_raise_dispute_on_in_progress_job() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let token_client = token::Client::new(&env, &native_token);
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
@@ -1355,7 +1422,7 @@ mod test {
 
     #[test]
     fn client_can_raise_dispute_on_submitted_job() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -1367,7 +1434,7 @@ mod test {
 
     #[test]
     fn freelancer_can_raise_dispute_on_in_progress_job() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
 
@@ -1378,7 +1445,7 @@ mod test {
 
     #[test]
     fn freelancer_can_raise_dispute_on_submitted_job() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -1391,7 +1458,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Contract, #2)")]
     fn raise_dispute_rejects_wrong_caller() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let stranger = Address::generate(&env);
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
@@ -1411,7 +1478,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Contract, #3)")]
     fn raise_dispute_rejects_completed_job() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -1432,11 +1499,11 @@ mod test {
 
     #[test]
     fn events_emitted_on_cancel_and_dispute() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.raise_dispute(&freelancer, &job_id);
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 });
+        client.resolve_dispute(&admin, &job_id, &DisputeResolution { client_bps: 10_000 });
 
         let events = env.events().all();
         assert!(events.len() >= 4);
@@ -1444,7 +1511,7 @@ mod test {
 
     #[test]
     fn events_emitted_on_withdraw_fees() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -1486,7 +1553,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Contract, #3)")]
     fn cancel_job_in_progress_panics_with_invalid_status() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
 
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
 
@@ -1502,7 +1569,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Contract, #3)")]
     fn cancel_job_completed_panics_with_invalid_status() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
 
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
 
@@ -1583,7 +1650,7 @@ mod test {
 
     #[test]
     fn resolve_dispute_50_50_split() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.raise_dispute(&user, &job_id);
@@ -1593,7 +1660,7 @@ mod test {
         let freelancer_pre = token_client.balance(&freelancer);
 
         // 50 / 50 split: client_bps = 5_000
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 5_000 });
+        client.resolve_dispute(&admin, &job_id, &DisputeResolution { client_bps: 5_000 });
 
         // client gets 500_000 (no fee on client portion)
         assert_eq!(token_client.balance(&user) - client_pre, 500_000);
@@ -1606,7 +1673,7 @@ mod test {
 
     #[test]
     fn resolve_dispute_custom_split_30_70() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.raise_dispute(&freelancer, &job_id);
@@ -1616,7 +1683,7 @@ mod test {
         let freelancer_pre = token_client.balance(&freelancer);
 
         // client gets 30%, freelancer gets 70% minus fee
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 3_000 });
+        client.resolve_dispute(&admin, &job_id, &DisputeResolution { client_bps: 3_000 });
 
         // client share = 300_000
         assert_eq!(token_client.balance(&user) - client_pre, 300_000);
@@ -1629,7 +1696,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Contract, #2)")]
     fn resolve_dispute_non_admin_unauthorized() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.raise_dispute(&user, &job_id);
@@ -1655,20 +1722,20 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Contract, #3)")]
     fn resolve_dispute_wrong_status_panics() {
-        let (env, client, _, user, _, native_token) = setup();
+        let (env, client, admin, user, _, native_token) = setup();
         // Job is Open, not Disputed
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 });
+        client.resolve_dispute(&admin, &job_id, &DisputeResolution { client_bps: 10_000 });
     }
 
     #[test]
     #[should_panic(expected = "Error(Contract, #3)")]
     fn resolve_dispute_in_progress_status_panics() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         // InProgress, not Disputed
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 });
+        client.resolve_dispute(&admin, &job_id, &DisputeResolution { client_bps: 0 });
     }
 
     #[test]
@@ -1679,7 +1746,7 @@ mod test {
         client.raise_dispute(&user, &job_id);
 
         // freelancer wins entirely
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 });
+        client.resolve_dispute(&admin, &job_id, &DisputeResolution { client_bps: 0 });
 
         // fee = 2.5% of 2_000_000 = 50_000
         assert_eq!(client.get_fees(&native_token), 50_000);
@@ -1694,11 +1761,11 @@ mod test {
 
     #[test]
     fn resolve_dispute_emits_event() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.raise_dispute(&user, &job_id);
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 5_000 });
+        client.resolve_dispute(&admin, &job_id, &DisputeResolution { client_bps: 5_000 });
 
         let events = env.events().all();
         assert!(events.len() >= 4); // created, accepted, disputed, resolved
@@ -1711,7 +1778,7 @@ mod test {
 
     #[test]
     fn approve_work_uses_updated_fee() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         // set fee to 5% (500 bps)
         client.update_fee(&500i128);
 
@@ -1728,8 +1795,28 @@ mod test {
         assert_eq!(post_balance - pre_balance, 950_000);
         assert_eq!(client.get_fees(&native_token), 50_000);
     }
-        assert_eq!(post_balance - pre_balance, expected_payout, "large amount: payout should be amount minus 2.5% fee");
-        assert_eq!(client.get_fees(&native_token), expected_fee, "large amount: fee should be exactly 2.5%");
+
+    #[test]
+    fn cancel_then_repost_job_lifecycle() {
+        let (env, client, _, user, _, native_token) = setup();
+        let first = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
+        assert_eq!(client.get_job_count(), 1);
+        assert_eq!(client.get_open_jobs_count(), 1);
+        assert_eq!(client.get_client_active_jobs_count(&user), 1);
+
+        client.cancel_job(&user, &first);
+        assert_eq!(client.get_job(&first).status, JobStatus::Cancelled);
+        assert_eq!(client.get_job_count(), 1);
+        assert_eq!(client.get_open_jobs_count(), 0);
+        assert_eq!(client.get_cancelled_jobs_count(), 1);
+        assert_eq!(client.get_client_active_jobs_count(&user), 0);
+
+        let second = client.post_job(&user, &2_000_000i128, &hash(&env), &0u64, &native_token);
+        assert_eq!(second, 2);
+        assert_eq!(client.get_job_count(), 2);
+        assert_eq!(client.get_job(&second).status, JobStatus::Open);
+        assert_eq!(client.get_open_jobs_count(), 1);
+        assert_eq!(client.get_client_active_jobs_count(&user), 1);
     }
 
     #[test]
@@ -1839,7 +1926,7 @@ mod test {
 
     #[test]
     fn get_open_jobs_count_decrements_on_accept() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         assert_eq!(client.get_open_jobs_count(), 1);
         client.accept_job(&freelancer, &job_id);
@@ -1857,7 +1944,7 @@ mod test {
 
     #[test]
     fn get_open_jobs_count_tracks_mixed_statuses() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         // Post 3 jobs
         let j1 = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         let j2 = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
@@ -1875,7 +1962,7 @@ mod test {
 
     #[test]
     fn get_open_jobs_count_zero_after_all_completed() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -1900,7 +1987,7 @@ mod test {
 
     #[test]
     fn get_cancelled_jobs_count_tracks_multiple_cancel_paths() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let direct_cancel =
             client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         let deadline_cancel = client.post_job(
@@ -1949,7 +2036,7 @@ mod test {
     fn status_transition_matrix_covers_valid_and_invalid_paths() {
         // Open -> InProgress is valid via accept_job
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.accept_job(&freelancer, &job_id);
@@ -1958,19 +2045,28 @@ mod test {
 
         // Open: invalid submit/approve/reject/enforce_deadline/resolve_dispute
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             expect_panic_with_contract_error(|| client.submit_work(&freelancer, &job_id), 3);
             expect_panic_with_contract_error(|| client.approve_work(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.reject_work(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.enforce_deadline(&user, &job_id), 3);
-            expect_panic_with_contract_error(|| client.resolve_dispute(&job_id, &user), 3);
+            expect_panic_with_contract_error(
+                || {
+                    client.resolve_dispute(
+                        &admin,
+                        &job_id,
+                        &DisputeResolution { client_bps: 10_000 },
+                    )
+                },
+                3,
+            );
         }
 
         // InProgress -> SubmittedForReview (submit), Cancelled (enforce_deadline), Disputed (raise_dispute)
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let deadline = 1_710_000_000 + 3600;
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &deadline, &native_token);
@@ -1979,7 +2075,7 @@ mod test {
             assert_eq!(client.get_job(&job_id).status, JobStatus::SubmittedForReview);
         }
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let deadline = 1_710_000_000 + 3600;
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &deadline, &native_token);
@@ -1991,7 +2087,7 @@ mod test {
             assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
         }
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.accept_job(&freelancer, &job_id);
@@ -2001,19 +2097,28 @@ mod test {
 
         // InProgress: invalid approve/reject/cancel/resolve_dispute
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.accept_job(&freelancer, &job_id);
             expect_panic_with_contract_error(|| client.approve_work(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.reject_work(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.cancel_job(&user, &job_id), 3);
-            expect_panic_with_contract_error(|| client.resolve_dispute(&job_id, &user), 3);
+            expect_panic_with_contract_error(
+                || {
+                    client.resolve_dispute(
+                        &admin,
+                        &job_id,
+                        &DisputeResolution { client_bps: 10_000 },
+                    )
+                },
+                3,
+            );
         }
 
         // SubmittedForReview -> Completed (approve), InProgress (reject), Disputed (raise_dispute)
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.accept_job(&freelancer, &job_id);
@@ -2022,7 +2127,7 @@ mod test {
             assert_eq!(client.get_job(&job_id).status, JobStatus::Completed);
         }
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.accept_job(&freelancer, &job_id);
@@ -2031,7 +2136,7 @@ mod test {
             assert_eq!(client.get_job(&job_id).status, JobStatus::InProgress);
         }
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.accept_job(&freelancer, &job_id);
@@ -2042,7 +2147,7 @@ mod test {
 
         // SubmittedForReview: invalid accept/cancel/enforce_deadline/resolve_dispute
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.accept_job(&freelancer, &job_id);
@@ -2050,12 +2155,21 @@ mod test {
             expect_panic_with_contract_error(|| client.accept_job(&freelancer, &job_id), 3);
             expect_panic_with_contract_error(|| client.cancel_job(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.enforce_deadline(&user, &job_id), 3);
-            expect_panic_with_contract_error(|| client.resolve_dispute(&job_id, &user), 3);
+            expect_panic_with_contract_error(
+                || {
+                    client.resolve_dispute(
+                        &admin,
+                        &job_id,
+                        &DisputeResolution { client_bps: 10_000 },
+                    )
+                },
+                3,
+            );
         }
 
         // Completed: invalid all transition operations
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.accept_job(&freelancer, &job_id);
@@ -2068,12 +2182,21 @@ mod test {
             expect_panic_with_contract_error(|| client.cancel_job(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.enforce_deadline(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.raise_dispute(&user, &job_id), 3);
-            expect_panic_with_contract_error(|| client.resolve_dispute(&job_id, &user), 3);
+            expect_panic_with_contract_error(
+                || {
+                    client.resolve_dispute(
+                        &admin,
+                        &job_id,
+                        &DisputeResolution { client_bps: 10_000 },
+                    )
+                },
+                3,
+            );
         }
 
         // Cancelled: invalid all transition operations
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.cancel_job(&user, &job_id);
@@ -2084,32 +2207,49 @@ mod test {
             expect_panic_with_contract_error(|| client.cancel_job(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.enforce_deadline(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.raise_dispute(&user, &job_id), 3);
-            expect_panic_with_contract_error(|| client.resolve_dispute(&job_id, &user), 3);
+            expect_panic_with_contract_error(
+                || {
+                    client.resolve_dispute(
+                        &admin,
+                        &job_id,
+                        &DisputeResolution { client_bps: 10_000 },
+                    )
+                },
+                3,
+            );
         }
 
         // Disputed -> Completed (winner freelancer), Cancelled (winner client)
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.accept_job(&freelancer, &job_id);
             client.raise_dispute(&user, &job_id);
-            client.resolve_dispute(&job_id, &freelancer);
+            client.resolve_dispute(
+                &admin,
+                &job_id,
+                &DisputeResolution { client_bps: 0 },
+            );
             assert_eq!(client.get_job(&job_id).status, JobStatus::Completed);
         }
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.accept_job(&freelancer, &job_id);
             client.raise_dispute(&freelancer, &job_id);
-            client.resolve_dispute(&job_id, &user);
+            client.resolve_dispute(
+                &admin,
+                &job_id,
+                &DisputeResolution { client_bps: 10_000 },
+            );
             assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
         }
 
         // Disputed: invalid accept/submit/approve/reject/cancel/enforce_deadline/raise_dispute
         {
-            let (env, client, _, user, freelancer, native_token) = setup();
+            let (env, client, admin, user, freelancer, native_token) = setup();
             let job_id =
                 client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
             client.accept_job(&freelancer, &job_id);
@@ -2130,7 +2270,7 @@ mod test {
     fn fee_invariant_fees_never_exceed_total_approvals() {
         // After N approvals, accrued fees must equal sum of individual fees
         // and must never exceed the total amount approved.
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let asset = token::StellarAssetClient::new(&env, &native_token);
         asset.mint(&user, &10_000_000_000i128);
 
@@ -2156,7 +2296,7 @@ mod test {
     #[test]
     fn fee_invariant_withdraw_zeroes_accrued_fees() {
         // After withdraw_fees, accrued fees must be exactly 0.
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
@@ -2170,7 +2310,7 @@ mod test {
     #[test]
     fn fee_invariant_payout_plus_fee_equals_amount() {
         // For every approval: payout + fee == job.amount (no funds created or destroyed).
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let amount: i128 = 1_000_000;
         let token_client = token::Client::new(&env, &native_token);
 
@@ -2191,7 +2331,7 @@ mod test {
     #[test]
     fn fee_invariant_dispute_freelancer_wins_payout_plus_fee_equals_amount() {
         // Same conservation invariant holds when dispute resolves in freelancer's favour.
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         let amount: i128 = 1_000_000;
         let token_client = token::Client::new(&env, &native_token);
 
@@ -2200,7 +2340,7 @@ mod test {
         client.raise_dispute(&user, &job_id);
 
         let pre_freelancer = token_client.balance(&freelancer);
-        client.resolve_dispute(&job_id, &freelancer);
+        client.resolve_dispute(&admin, &job_id, &DisputeResolution { client_bps: 0 });
         let post_freelancer = token_client.balance(&freelancer);
 
         let payout = post_freelancer - pre_freelancer;
@@ -2312,9 +2452,59 @@ mod test {
         let events = env.events().all();
         assert!(!events.is_empty(), "fee_updated event should be emitted");
     }
+
+    #[test]
+    fn post_job_unlimited_when_max_active_jobs_not_set() {
+        let (env, client, _, user, _, native_token) = setup();
+        assert_eq!(client.get_max_active_jobs_per_client(), 0);
+        client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
+        client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
+        client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
+        assert_eq!(client.get_client_active_jobs_count(&user), 3);
+    }
+
+    #[test]
+    fn post_job_blocked_at_active_job_limit() {
+        let (env, client, admin, user, _, native_token) = setup();
+        client.set_max_active_jobs_per_client(&admin, &2);
+        client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
+        client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
+        assert_eq!(client.get_client_active_jobs_count(&user), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #15)")]
+    fn post_job_panics_when_active_job_limit_exceeded() {
+        let (env, client, admin, user, _, native_token) = setup();
+        client.set_max_active_jobs_per_client(&admin, &2);
+        client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
+        client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
+        client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
+    }
+
+    #[test]
+    fn post_job_allowed_after_cancel_frees_active_slot() {
+        let (env, client, admin, user, _, native_token) = setup();
+        client.set_max_active_jobs_per_client(&admin, &1);
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
+        client.cancel_job(&user, &job_id);
+        assert_eq!(client.get_client_active_jobs_count(&user), 0);
+        let repost_id = client.post_job(&user, &2_000_000i128, &hash(&env), &0u64, &native_token);
+        assert_eq!(repost_id, 2);
+        assert_eq!(client.get_job(&repost_id).status, JobStatus::Open);
+        assert_eq!(client.get_client_active_jobs_count(&user), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn set_max_active_jobs_per_client_rejects_non_admin() {
+        let (env, client, _, user, _, _) = setup();
+        client.set_max_active_jobs_per_client(&user, &1);
+    }
+
     #[test]
     fn get_jobs_by_status_filter() {
-        let (env, client, _, user, freelancer, native_token) = setup();
+        let (env, client, admin, user, freelancer, native_token) = setup();
         
         // Post 3 jobs
         let id1 = client.post_job(&user, &1_000_000i128, &hash(&env), &0u64, &native_token);
@@ -2339,35 +2529,5 @@ mod test {
         let review_jobs = client.get_jobs_by_status(&JobStatus::SubmittedForReview);
         assert_eq!(review_jobs.len(), 1);
         assert_eq!(review_jobs.get(0).unwrap().amount, 3_000_000);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::{Env, Address};
-
-    #[test]
-    #[should_panic]
-    fn test_double_initialize_fails() {
-        let e = Env::default();
-        let admin = Address::generate(&e);
-        let token = Address::generate(&e);
-
-        EscrowContract::initialize(e.clone(), admin.clone(), token.clone());
-        // second call should panic
-        EscrowContract::initialize(e.clone(), admin, token);
-    }
-
-    #[test]
-    fn test_initialize_once_works() {
-        let e = Env::default();
-        let admin = Address::generate(&e);
-        let token = Address::generate(&e);
-
-        EscrowContract::initialize(e.clone(), admin.clone(), token.clone());
-
-        let stored_admin: Address = e.storage().instance().get(&DataKey::Admin).unwrap();
-        assert_eq!(stored_admin, admin);
     }
 }
